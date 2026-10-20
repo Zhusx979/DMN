@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Jupyter
+.ipynb_checkpoints/
+*.jupyter/
+
+# Experiment outputs
+logs/
+ckpts/
+checkpoint/
+.aim/
+summaries/
+segmentation/loss/
+segmentation/visualization/
+segmentation/checkpoint/
+
+# Data and model weights (download datasets separately; see README)
+data/
+*.pth
+*.pt
+*.ckpt
+*.tar.gz
+*.zip
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Per-run experiment outputs
+runs/
+segmentation/results/
+
+# Local-only material (code-only public tree)
+docs/
+figures/
+notebooks/
+README.md
+benchmarks/efficiency_report*.md

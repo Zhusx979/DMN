@@ -1,0 +1,29 @@
+# Core deep-learning stack
+torch>=2.0
+torchvision>=0.15
+
+# Model helpers
+einops
+timm
+
+# Data / IO
+numpy
+pandas
+Pillow
+opencv-python
+nibabel
+
+# Preprocessing / losses
+albumentations
+monai
+
+# Metrics / plotting / utilities
+scikit-learn
+matplotlib
+tqdm
+loguru
+prefetch-generator
+tensorboardX
+
+# Experiment tracking (optional; scripts run without it)
+aim
