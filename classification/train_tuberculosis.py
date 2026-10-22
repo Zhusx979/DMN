@@ -76,6 +76,7 @@ class NullRun:
 def train(model, train_loader, criterion, optimizer, device, epoch, run, reg_weight=1.0):
     losses, reg_losses = [], []
     model.train()
+    core = model.module if isinstance(model, nn.DataParallel) else model
     total, correct = 0, 0
     with tqdm(total=len(train_loader)) as pbar:
         for batch_idx, (images, labels, _) in enumerate(train_loader):
@@ -86,8 +87,8 @@ def train(model, train_loader, criterion, optimizer, device, epoch, run, reg_wei
 
             # Dual Mapping constraint regularizer (paper Eqs. 9-10), added to
             # the task loss.  Non-DM baselines (ViT, ...) have no W_S matrices.
-            if hasattr(model, "regularization_loss"):
-                reg_loss = model.regularization_loss()
+            if hasattr(core, "regularization_loss"):
+                reg_loss = core.regularization_loss()
             else:
                 reg_loss = torch.zeros((), device=device)
             total_loss = loss + reg_weight * reg_loss
@@ -198,13 +199,20 @@ def parse_args():
     parser.add_argument("--syn_variant", default="random",
                         choices=["random", "random_fixed", "dense", "factorized_random", "mix", "static"],
                         help="Synthesizer attention variant (for --network SynthesizerViT)")
-    parser.add_argument("--gpu", default="0", help="CUDA_VISIBLE_DEVICES (default: 0)")
+    parser.add_argument("--gpu", default="0",
+                        help="CUDA_VISIBLE_DEVICES (default: 0); e.g. 0,1 together with --parallel")
     parser.add_argument("--epochs", type=int, default=None, help="override paper epochs (600)")
     parser.add_argument("--patch_size", type=int, default=None,
                         help="override paper patch size (16); draft Table 3 uses 8 / 32")
     parser.add_argument("--depth", type=int, default=None,
                         help="override paper depth (8); draft Table 3 uses 4 / 16")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="override the paper seed (911); the TBX11K split is "
+                             "seed-dependent (per-class 800-image sample + shuffle)")
     parser.add_argument("--suffix", default=None, help="run-name suffix (default: optimizer_depth_patch; deterministic so re-runs auto-resume)")
+    parser.add_argument("--parallel", action="store_true",
+                        help="wrap the model in torch.nn.DataParallel over all visible GPUs "
+                             "(use --gpu 0,1 to expose two); default off = the single-GPU path, unchanged")
     return parser.parse_args()
 
 
@@ -212,6 +220,7 @@ config = Config()
 args = parse_args()
 config.network = args.network
 config.gpu = args.gpu
+parallel = bool(args.parallel)   # optional multi-GPU DataParallel (default off)
 # configs store the optimizer fully lower-case ("adamw"); the branch below
 # and the run suffix expect the canonical "AdamW" spelling
 config.optimizer = {"adam": "Adam", "adamw": "AdamW",
@@ -222,6 +231,8 @@ if args.patch_size is not None:
     config.patch_size = args.patch_size
 if args.depth is not None:
     config.depth = args.depth
+if args.seed is not None:
+    config.seed = args.seed
 # rebuild the default suffix after any ablation override so draft-Table-3
 # runs land in their own folders instead of colliding with the default run
 # (an explicit --suffix always wins)
@@ -327,6 +338,18 @@ try:
 except Exception as exc:  # profiling must never break a training run
     logger.warning(f"efficiency profiling skipped: {exc}")
 
+# ---- optional multi-GPU data parallelism (--parallel).  The efficiency
+# fingerprint above is taken on the single-GPU model so it stays comparable
+# with earlier runs.  All checkpointing below uses `core_model` (the inner
+# module) so on-disk state_dict keys stay identical to single-GPU runs. ----
+if parallel:
+    n_gpus = torch.cuda.device_count()
+    if n_gpus < 2:
+        raise SystemExit(
+            "--parallel requires >= 2 visible GPUs (got {}); pass e.g. --gpu 0,1".format(n_gpus))
+    model = nn.DataParallel(model)
+core_model = model.module if isinstance(model, nn.DataParallel) else model
+
 criterion = nn.CrossEntropyLoss()
 
 if config.optimizer == "AdamW":
@@ -352,6 +375,9 @@ if aim is None:
 else:
     run = aim.Run(experiment=exp_name)
 run["hparams"] = config.__dict__
+if parallel:
+    logger.info("Parallel mode: torch.nn.DataParallel over {} GPUs (checkpoints and L_reg use the inner module)".format(
+        torch.cuda.device_count()))
 
 # ==================== 训练循环 ====================
 # ---- interruption-safe checkpointing: single-writer lock, graceful
@@ -359,7 +385,7 @@ run["hparams"] = config.__dict__
 acquire_run_lock(ckpt_folder)
 install_graceful_stop()
 best_val_acc, best_val_epoch, test_acc = -1, -1, 0.0
-start_epoch, best = load_resume_state(ckpt_folder, model, optimizer, lr_scheduler,
+start_epoch, best = load_resume_state(ckpt_folder, core_model, optimizer, lr_scheduler,
                                       config.num_classes)
 if start_epoch > 0:
     best_val_acc = best.get("best_val_acc", -1)
@@ -387,7 +413,7 @@ for epoch in range(start_epoch, config.nepoch):
                                        config.num_classes, "Test", run)
         logger.info(f"Epoch {epoch}: Test Loss {test_loss:.4f}, Test Acc {test_acc:.4f}")
 
-        save_best(ckpt_folder, model)
+        save_best(ckpt_folder, core_model)
         logger.info(f"Best model saved to {ckpt_folder / 'ckpt_best.pth'}")
     else:
         logger.info(f"Epoch {epoch}: Val acc did not increase. Best val acc {best_val_acc:.4f} at epoch {best_val_epoch}, corresponding test acc {test_acc:.4f}")
@@ -399,7 +425,7 @@ for epoch in range(start_epoch, config.nepoch):
 
     # full resume state (model+optimizer+scheduler+RNG), rewritten atomically
     # every epoch -- bounded: exactly ckpt_last.pth + ckpt_best.pth on disk
-    save_resume_state(ckpt_folder, model, optimizer, lr_scheduler, epoch,
+    save_resume_state(ckpt_folder, core_model, optimizer, lr_scheduler, epoch,
                       {"best_val_acc": best_val_acc, "best_val_epoch": best_val_epoch,
                        "test_acc": test_acc}, config.num_classes)
     if stop_requested():
@@ -411,7 +437,9 @@ if epoch == config.nepoch - 1:
     summary = {
         "dataset": config.dataset, "network": config.network, "suffix": config.suffix,
         "patch_size": config.patch_size, "depth": config.depth, "epochs": config.nepoch,
+        "seed": config.seed,
         "syn_variant": config.syn_variant if config.network == "SynthesizerViT" else None,
+        "parallel": parallel,
         "best_val_acc": best_val_acc, "best_val_epoch": best_val_epoch,
         "test_acc": test_acc, "finished": datetime.now().isoformat(),
     }

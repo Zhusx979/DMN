@@ -139,11 +139,13 @@ def log(msg):
         f.write(line + "\n")
 
 
-def dispatch(job, gpu):
+def dispatch(job, gpu, seed=None):
     ds = DATASETS[job["dataset"]]
     cmd = [sys.executable, ds["script"], "--network", job["model"],
            "--patch_size", str(job["patch"]), "--depth", str(job["depth"]),
            "--gpu", str(gpu)]
+    if seed is not None:
+        cmd += ["--seed", str(seed)]
     if job.get("variant") is not None:
         cmd += ["--syn_variant", job["variant"]]
     log(f"GPU{gpu} start {job['run_name']}: {' '.join(cmd)}")
@@ -174,10 +176,17 @@ def status_report(jobs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--gpus", nargs="+", default=["0", "1"])
+    parser.add_argument("--gpus", nargs="+", default=["0", "1"],
+                        help="GPU ids; repeat an id to pack several jobs on it "
+                             "(e.g. --gpus 0 0 1 1 runs two jobs per card)")
     parser.add_argument("--only", nargs="*", default=None, choices=list(DATASETS),
                         help="restrict to datasets (tbx11k, bc)")
+    parser.add_argument("--runs", nargs="*", default=None,
+                        help="restrict to specific run_names, in the given order")
     parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="override the trainer seed for every dispatched job "
+                             "(default: the trainer's config seed, 911)")
     parser.add_argument("--status", action="store_true", help="print progress and exit")
     parser.add_argument("--with_syn", action="store_true",
                         help="append the Synthesizer family (SynthesizerViT) jobs")
@@ -191,6 +200,12 @@ def main():
     jobs = make_jobs(args.with_syn, args.syn_variants, args.syn_configs)
     if args.only:
         jobs = [j for j in jobs if j["dataset"] in args.only]
+    if args.runs:
+        by_name = {j["run_name"]: j for j in jobs}
+        unknown = [n for n in args.runs if n not in by_name]
+        if unknown:
+            parser.error(f"unknown --runs names: {unknown}")
+        jobs = [by_name[n] for n in args.runs]
 
     if args.status:
         status_report(jobs)
@@ -202,7 +217,14 @@ def main():
 
     pending = [j for j in jobs if not is_done(j)]
     failed = {}
-    slots = {gpu: None for gpu in args.gpus}   # gpu -> (job, proc, started_at)
+    # slot -> real GPU id; a GPU id may repeat in --gpus to run several jobs
+    # on the same card concurrently (e.g. --gpus 0 0 1 1 packs two per card)
+    gpu_of_slot, _seen = {}, {}
+    for g in args.gpus:
+        _seen[g] = _seen.get(g, 0) + 1
+        slot = g if _seen[g] == 1 else "{}#{}".format(g, _seen[g])
+        gpu_of_slot[slot] = g
+    slots = {slot: None for slot in gpu_of_slot}   # slot -> (job, proc, started_at)
     retry_counts = {j["run_name"]: 0 for j in jobs}
 
     while pending or any(v is not None for v in slots.values()):
@@ -215,7 +237,8 @@ def main():
             else:
                 still.append(j)
         pending = still
-        for gpu, busy in list(slots.items()):
+        for slot, busy in list(slots.items()):
+            gpu = gpu_of_slot[slot]
             if busy is not None:
                 job, proc, t0 = busy
                 rc = proc.poll()
@@ -241,9 +264,9 @@ def main():
                         log(f"GPU{gpu} crashed {job['run_name']} rc={rc} "
                             f"({dur:.1f} min) -- retry {n}/{args.retries} (resumes)")
                         pending.insert(0, job)
-                slots[gpu] = None
+                slots[slot] = None
                 progressed = True
-            if slots[gpu] is None and pending:
+            if slots[slot] is None and pending:
                 # skip jobs whose trainer is already alive (started by another
                 # launcher or an earlier instance): double-dispatch would only
                 # crash against the single-writer lock and burn retries
@@ -251,8 +274,8 @@ def main():
                             if not is_running_externally(j)), None)
                 if idx is not None:
                     job = pending.pop(idx)
-                    proc = dispatch(job, gpu)
-                    slots[gpu] = (job, proc, time.time())
+                    proc = dispatch(job, gpu, args.seed)
+                    slots[slot] = (job, proc, time.time())
                     progressed = True
         if not progressed:
             time.sleep(10)
