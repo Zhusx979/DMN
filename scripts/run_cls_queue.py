@@ -7,9 +7,10 @@ Experiment matrix (20 runs by default):
     configs {(p16,d8) = Table 2 headline, (p8,d8), (p32,d8), (p16,d4),
     (p16,d16) = Table 3 ablations}
 
-With --with_syn the Synthesizer family (SynthesizerViT, variants dense /
-random / factorized_random) is appended as extra jobs: every config by
-default, or only the p16/d8 headline with --syn_configs default.
+With --with_syn the Synthesizer family (SynthesizerViT, the paper's three
+main-comparison variants dense / random / factorized_random) is appended as
+extra jobs at the paper default configuration (p16/d8) only; pass
+--syn_configs all to extend them across the patch/depth ablation grid.
 
 Each run is executed by the dedicated trainer (classification/
 train_tuberculosis.py / train_breast_cancer.py) with --patch_size/--depth
@@ -19,7 +20,8 @@ its own checkpoint folder and auto-resumes there (see utils/training.py).
 Interruption safety (same design as run_seg_queue.py):
     * trainers checkpoint every epoch and resume automatically;
     * re-run this launcher any time -- finished runs are recognized by
-      ``summary.json`` inside the trainer's ckpt folder and skipped;
+      ``summary.json`` (kept in place, or inside an ``_archive*/`` folder after
+      a disk-space sweep) and skipped;
     * crashed runs are retried up to --retries times, then skipped.
 
 Usage (from the repository root):
@@ -70,7 +72,7 @@ def run_dir_of(job):
         job["patch"], job["depth"], job.get("variant"))
 
 
-def make_jobs(with_syn=False, syn_variants=None, syn_configs="all"):
+def make_jobs(with_syn=False, syn_variants=None, syn_configs="default"):
     jobs = []
     syn_variants = SYN_VARIANTS if syn_variants is None else syn_variants
 
@@ -90,7 +92,8 @@ def make_jobs(with_syn=False, syn_variants=None, syn_configs="all"):
             for model in MODELS:
                 add(ds, model, patch, depth, "T3")
     if with_syn:
-        # synthesizer family: headline config first, then the remaining ones
+        # synthesizer family: the paper's main comparison is the default
+        # p16/d8 configuration only; --syn_configs all adds the ablation grid
         syn_cfgs = CONFIGS if syn_configs == "all" else [(16, 8)]
         for patch, depth in syn_cfgs:
             for ds in DATASETS:
@@ -99,8 +102,26 @@ def make_jobs(with_syn=False, syn_variants=None, syn_configs="all"):
     return jobs
 
 
+def summary_path_of(job):
+    """The run's finished summary.json, in place or moved into an _archive*/.
+
+    Disk-space sweeps move finished runs into ckpts/<dataset>/_archive*/ (weights
+    deleted, summary/logs kept), so a moved summary.json still marks the run as
+    finished; runs stopped mid-way only ever have summary_stopped.json there.
+    """
+    run_dir = run_dir_of(job)
+    path = run_dir / "summary.json"
+    if path.exists():
+        return path
+    for arch in run_dir.parents[1].glob("_archive*"):   # ckpts/<dataset>/_archive*
+        for s in arch.rglob("summary.json"):
+            if run_dir.parent.name in s.parts and run_dir.name in s.parts:
+                return s
+    return None
+
+
 def is_done(job):
-    return (run_dir_of(job) / "summary.json").exists()
+    return summary_path_of(job) is not None
 
 
 def is_running_externally(job):
@@ -156,15 +177,14 @@ def status_report(jobs):
     lines = ["", f"{'run_name':<22} {'status':<10} {'test acc':>9} {'draft':>7} {'delta':>7}",
              "-" * 60]
     for job in jobs:
-        rd = run_dir_of(job)
         target = draft_target(job)
         t = f"{target:>7.4f}" if target else "      -"
-        if (rd / "summary.json").exists():
-            s = json.loads((rd / "summary.json").read_text())
-            acc = s["test_acc"]
+        sp = summary_path_of(job)
+        if sp is not None:
+            acc = json.loads(sp.read_text())["test_acc"]
             d = f"{acc - target:>+7.4f}" if target else "      -"
             lines.append(f"{job['run_name']:<22} {'DONE':<10} {acc:>9.4f} {t} {d}")
-        elif (rd / "run.lock").exists():
+        elif is_running_externally(job):
             lines.append(f"{job['run_name']:<22} {'RUNNING':<10} {'-':>9} {t}")
         else:
             lines.append(f"{job['run_name']:<22} {'PENDING':<10} {'-':>9} {t}")
@@ -193,8 +213,9 @@ def main():
     parser.add_argument("--syn_variants", nargs="+", default=SYN_VARIANTS,
                         choices=list(SYN_TAG),
                         help="synthesizer variants to queue (with --with_syn)")
-    parser.add_argument("--syn_configs", choices=["all", "default"], default="all",
-                        help="syn configs: all five, or just the p16/d8 headline")
+    parser.add_argument("--syn_configs", choices=["all", "default"], default="default",
+                        help="syn configs: the paper default p16/d8 only (default), "
+                             "or all five (patch/depth ablation grid)")
     args = parser.parse_args()
 
     jobs = make_jobs(args.with_syn, args.syn_variants, args.syn_configs)

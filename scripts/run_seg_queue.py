@@ -6,6 +6,11 @@ Runs the full comparison matrix -- datasets {BRISC, CardiacUDA-G, CardiacUDA-R}
 x models {DualMappingViTSeg, ViTSeg} x configs {(p8,d8), (p16,d8) default,
 (p32,d8), (p16,d4), (p16,d16)} -- as two parallel workers, one per GPU.
 
+With --with_syn the Synthesizer family (SynthesizerViTSeg, the paper's three
+main-comparison variants dense / random / factorized_random) is appended at
+the paper default configuration (p16/d8) for the two table datasets (BRISC,
+CardiacUDA-G); pass --syn_configs all to extend them across the ablation grid.
+
 Interruption safety (server reboots / kills are expected):
     * every run checkpoints each epoch and resumes automatically
       (see segmentation/train_segmentation.py);
@@ -44,7 +49,7 @@ SYN_TAG = {"dense": "SynDense", "random": "SynRandom",
            "static": "SynStatic", "mix": "SynMix"}
 
 
-def make_jobs(with_syn=False, syn_variants=None, syn_configs="all"):
+def make_jobs(with_syn=False, syn_variants=None, syn_configs="default"):
     """Ordered job list: headline default rows first, then depth/patch variants."""
     dm, vit = "DualMappingViTSeg", "ViTSeg"
     syn_variants = SYN_VARIANTS if syn_variants is None else syn_variants
@@ -69,7 +74,9 @@ def make_jobs(with_syn=False, syn_variants=None, syn_configs="all"):
             add(ds, site, vit, patch, depth, 1)
     if with_syn:
         # synthesizer family for the two table datasets (CardiacUDA-R stays
-        # excluded: methodology reference only, see docs/PAPER_MAPPING.md)
+        # excluded: methodology reference only, see docs/PAPER_MAPPING.md);
+        # the paper's main comparison is the default p16/d8 only, and
+        # --syn_configs all adds the patch/depth ablation grid
         syn_cfgs = CONFIGS if syn_configs == "all" else [(16, 8)]
         for ds, site in [("BRISC", None), ("CardiacUDA", "G")]:
             for patch, depth in syn_cfgs:
@@ -82,8 +89,26 @@ def run_dir_of(job):
     return RUNS_ROOT / job["run_name"]
 
 
+def summary_path_of(job):
+    """The run's finished summary.json, in place or moved into an _archive*.
+
+    Finished runs swept off the main tree keep their summary inside
+    segmentation/runs/_archive*/<run_name>/, so a moved summary.json still
+    counts as done (mid-run sweeps would only have summary_stopped.json).
+    """
+    run_dir = run_dir_of(job)
+    path = run_dir / "summary.json"
+    if path.exists():
+        return path
+    for arch in RUNS_ROOT.glob("_archive*"):
+        for s in arch.rglob("summary.json"):
+            if run_dir.name in s.parts:
+                return s
+    return None
+
+
 def is_done(job):
-    return (run_dir_of(job) / "summary.json").exists()
+    return summary_path_of(job) is not None
 
 
 def log(msg):
@@ -112,8 +137,9 @@ def status_report(jobs):
              "-" * 78]
     for job in jobs:
         rd = run_dir_of(job)
-        if (rd / "summary.json").exists():
-            s = json.loads((rd / "summary.json").read_text())
+        sp = summary_path_of(job)
+        if sp is not None:
+            s = json.loads(sp.read_text())
             t = s.get("test", {})
             lines.append(f"{job['run_name']:<32} {'DONE':<12} "
                          f"{s.get('best_epoch'):<11} "
@@ -147,8 +173,9 @@ def main():
     parser.add_argument("--syn_variants", nargs="+", default=SYN_VARIANTS,
                         choices=list(SYN_TAG),
                         help="synthesizer variants to queue (with --with_syn)")
-    parser.add_argument("--syn_configs", choices=["all", "default"], default="all",
-                        help="syn configs: all five, or just the p16/d8 headline")
+    parser.add_argument("--syn_configs", choices=["all", "default"], default="default",
+                        help="syn configs: the paper default p16/d8 only (default), "
+                             "or all five (patch/depth ablation grid)")
     parser.add_argument("--max_hours", type=float, default=None,
                         help="stop dispatching new jobs after this many hours")
     args = parser.parse_args()
