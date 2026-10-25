@@ -7,9 +7,10 @@ Experiment matrix (20 runs by default):
     configs {(p16,d8) = Table 2 headline, (p8,d8), (p32,d8), (p16,d4),
     (p16,d16) = Table 3 ablations}
 
-With --with_syn the Synthesizer family (SynthesizerViT, variants dense /
-random / factorized_random) is appended as extra jobs: every config by
-default, or only the p16/d8 headline with --syn_configs default.
+With --with_syn the Synthesizer family (SynthesizerViT, the paper's three
+main-comparison variants dense / random / factorized_random) is appended as
+extra jobs at the paper default configuration (p16/d8) only; pass
+--syn_configs all to extend them across the patch/depth ablation grid.
 
 Each run is executed by the dedicated trainer (classification/
 train_tuberculosis.py / train_breast_cancer.py) with --patch_size/--depth
@@ -19,7 +20,8 @@ its own checkpoint folder and auto-resumes there (see utils/training.py).
 Interruption safety (same design as run_seg_queue.py):
     * trainers checkpoint every epoch and resume automatically;
     * re-run this launcher any time -- finished runs are recognized by
-      ``summary.json`` inside the trainer's ckpt folder and skipped;
+      ``summary.json`` (kept in place, or inside an ``_archive*/`` folder after
+      a disk-space sweep) and skipped;
     * crashed runs are retried up to --retries times, then skipped.
 
 Usage (from the repository root):
@@ -70,7 +72,7 @@ def run_dir_of(job):
         job["patch"], job["depth"], job.get("variant"))
 
 
-def make_jobs(with_syn=False, syn_variants=None, syn_configs="all"):
+def make_jobs(with_syn=False, syn_variants=None, syn_configs="default"):
     jobs = []
     syn_variants = SYN_VARIANTS if syn_variants is None else syn_variants
 
@@ -90,7 +92,8 @@ def make_jobs(with_syn=False, syn_variants=None, syn_configs="all"):
             for model in MODELS:
                 add(ds, model, patch, depth, "T3")
     if with_syn:
-        # synthesizer family: headline config first, then the remaining ones
+        # synthesizer family: the paper's main comparison is the default
+        # p16/d8 configuration only; --syn_configs all adds the ablation grid
         syn_cfgs = CONFIGS if syn_configs == "all" else [(16, 8)]
         for patch, depth in syn_cfgs:
             for ds in DATASETS:
@@ -99,8 +102,26 @@ def make_jobs(with_syn=False, syn_variants=None, syn_configs="all"):
     return jobs
 
 
+def summary_path_of(job):
+    """The run's finished summary.json, in place or moved into an _archive*/.
+
+    Disk-space sweeps move finished runs into ckpts/<dataset>/_archive*/ (weights
+    deleted, summary/logs kept), so a moved summary.json still marks the run as
+    finished; runs stopped mid-way only ever have summary_stopped.json there.
+    """
+    run_dir = run_dir_of(job)
+    path = run_dir / "summary.json"
+    if path.exists():
+        return path
+    for arch in run_dir.parents[1].glob("_archive*"):   # ckpts/<dataset>/_archive*
+        for s in arch.rglob("summary.json"):
+            if run_dir.parent.name in s.parts and run_dir.name in s.parts:
+                return s
+    return None
+
+
 def is_done(job):
-    return (run_dir_of(job) / "summary.json").exists()
+    return summary_path_of(job) is not None
 
 
 def is_running_externally(job):
@@ -139,11 +160,13 @@ def log(msg):
         f.write(line + "\n")
 
 
-def dispatch(job, gpu):
+def dispatch(job, gpu, seed=None):
     ds = DATASETS[job["dataset"]]
     cmd = [sys.executable, ds["script"], "--network", job["model"],
            "--patch_size", str(job["patch"]), "--depth", str(job["depth"]),
            "--gpu", str(gpu)]
+    if seed is not None:
+        cmd += ["--seed", str(seed)]
     if job.get("variant") is not None:
         cmd += ["--syn_variant", job["variant"]]
     log(f"GPU{gpu} start {job['run_name']}: {' '.join(cmd)}")
@@ -154,15 +177,14 @@ def status_report(jobs):
     lines = ["", f"{'run_name':<22} {'status':<10} {'test acc':>9} {'draft':>7} {'delta':>7}",
              "-" * 60]
     for job in jobs:
-        rd = run_dir_of(job)
         target = draft_target(job)
         t = f"{target:>7.4f}" if target else "      -"
-        if (rd / "summary.json").exists():
-            s = json.loads((rd / "summary.json").read_text())
-            acc = s["test_acc"]
+        sp = summary_path_of(job)
+        if sp is not None:
+            acc = json.loads(sp.read_text())["test_acc"]
             d = f"{acc - target:>+7.4f}" if target else "      -"
             lines.append(f"{job['run_name']:<22} {'DONE':<10} {acc:>9.4f} {t} {d}")
-        elif (rd / "run.lock").exists():
+        elif is_running_externally(job):
             lines.append(f"{job['run_name']:<22} {'RUNNING':<10} {'-':>9} {t}")
         else:
             lines.append(f"{job['run_name']:<22} {'PENDING':<10} {'-':>9} {t}")
@@ -174,23 +196,37 @@ def status_report(jobs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--gpus", nargs="+", default=["0", "1"])
+    parser.add_argument("--gpus", nargs="+", default=["0", "1"],
+                        help="GPU ids; repeat an id to pack several jobs on it "
+                             "(e.g. --gpus 0 0 1 1 runs two jobs per card)")
     parser.add_argument("--only", nargs="*", default=None, choices=list(DATASETS),
                         help="restrict to datasets (tbx11k, bc)")
+    parser.add_argument("--runs", nargs="*", default=None,
+                        help="restrict to specific run_names, in the given order")
     parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="override the trainer seed for every dispatched job "
+                             "(default: the trainer's config seed, 911)")
     parser.add_argument("--status", action="store_true", help="print progress and exit")
     parser.add_argument("--with_syn", action="store_true",
                         help="append the Synthesizer family (SynthesizerViT) jobs")
     parser.add_argument("--syn_variants", nargs="+", default=SYN_VARIANTS,
                         choices=list(SYN_TAG),
                         help="synthesizer variants to queue (with --with_syn)")
-    parser.add_argument("--syn_configs", choices=["all", "default"], default="all",
-                        help="syn configs: all five, or just the p16/d8 headline")
+    parser.add_argument("--syn_configs", choices=["all", "default"], default="default",
+                        help="syn configs: the paper default p16/d8 only (default), "
+                             "or all five (patch/depth ablation grid)")
     args = parser.parse_args()
 
     jobs = make_jobs(args.with_syn, args.syn_variants, args.syn_configs)
     if args.only:
         jobs = [j for j in jobs if j["dataset"] in args.only]
+    if args.runs:
+        by_name = {j["run_name"]: j for j in jobs}
+        unknown = [n for n in args.runs if n not in by_name]
+        if unknown:
+            parser.error(f"unknown --runs names: {unknown}")
+        jobs = [by_name[n] for n in args.runs]
 
     if args.status:
         status_report(jobs)
@@ -202,7 +238,14 @@ def main():
 
     pending = [j for j in jobs if not is_done(j)]
     failed = {}
-    slots = {gpu: None for gpu in args.gpus}   # gpu -> (job, proc, started_at)
+    # slot -> real GPU id; a GPU id may repeat in --gpus to run several jobs
+    # on the same card concurrently (e.g. --gpus 0 0 1 1 packs two per card)
+    gpu_of_slot, _seen = {}, {}
+    for g in args.gpus:
+        _seen[g] = _seen.get(g, 0) + 1
+        slot = g if _seen[g] == 1 else "{}#{}".format(g, _seen[g])
+        gpu_of_slot[slot] = g
+    slots = {slot: None for slot in gpu_of_slot}   # slot -> (job, proc, started_at)
     retry_counts = {j["run_name"]: 0 for j in jobs}
 
     while pending or any(v is not None for v in slots.values()):
@@ -215,7 +258,8 @@ def main():
             else:
                 still.append(j)
         pending = still
-        for gpu, busy in list(slots.items()):
+        for slot, busy in list(slots.items()):
+            gpu = gpu_of_slot[slot]
             if busy is not None:
                 job, proc, t0 = busy
                 rc = proc.poll()
@@ -241,9 +285,9 @@ def main():
                         log(f"GPU{gpu} crashed {job['run_name']} rc={rc} "
                             f"({dur:.1f} min) -- retry {n}/{args.retries} (resumes)")
                         pending.insert(0, job)
-                slots[gpu] = None
+                slots[slot] = None
                 progressed = True
-            if slots[gpu] is None and pending:
+            if slots[slot] is None and pending:
                 # skip jobs whose trainer is already alive (started by another
                 # launcher or an earlier instance): double-dispatch would only
                 # crash against the single-writer lock and burn retries
@@ -251,8 +295,8 @@ def main():
                             if not is_running_externally(j)), None)
                 if idx is not None:
                     job = pending.pop(idx)
-                    proc = dispatch(job, gpu)
-                    slots[gpu] = (job, proc, time.time())
+                    proc = dispatch(job, gpu, args.seed)
+                    slots[slot] = (job, proc, time.time())
                     progressed = True
         if not progressed:
             time.sleep(10)
