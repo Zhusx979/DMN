@@ -25,6 +25,7 @@ radiograph stays legible away from the hot regions.
 Usage
 -----
     python scripts/make_gradcam_figure.py --dataset tbx11k   # p32/d8 pair
+    python scripts/make_gradcam_figure.py --dataset tbx11k --skip-per-class 2
     python scripts/make_gradcam_figure.py --dataset bc       # p16/d8 pair
 """
 
@@ -248,7 +249,7 @@ def display_image(tensor, dataset_key):
 
 def select_examples(model_vit, model_dmn, dataset, pred_vit, pred_dmn, device,
                     dataset_key, class_names, n_per_class=2, cap=25,
-                    min_pos=MIN_POS):
+                    min_pos=MIN_POS, skip_per_class=0):
     """Correct for both models, shared test split, non-degenerate Grad-CAMs."""
     index = {p: i for i, (p, _) in enumerate(dataset.samples)}
     common = set(pred_vit) & set(pred_dmn)
@@ -259,12 +260,18 @@ def select_examples(model_vit, model_dmn, dataset, pred_vit, pred_dmn, device,
                        and pred_vit[n][0] == pred_vit[n][1]
                        and pred_dmn[n][0] == pred_dmn[n][1])
         got = []
+        usable = 0
         for name in cands[:cap]:
             tensor, label, _ = dataset[index[name]]
             x = tensor.unsqueeze(0).to(device)
             cam_v, pos_v = grad_cam(model_vit, x, int(label))
             cam_d, pos_d = grad_cam(model_dmn, x, int(label))
             if pos_v < min_pos or pos_d < min_pos:
+                continue
+            usable += 1
+            if usable <= skip_per_class:
+                print("  skip {}: {} (usable #{})".format(
+                    class_names[cls], Path(name).name, usable))
                 continue
             got.append({"name": name, "label": int(label),
                         "original": display_image(tensor, dataset_key),
@@ -386,6 +393,14 @@ def main():
     parser.add_argument("--vit-ckpt", default=None)
     parser.add_argument("--dmn-ckpt", default=None)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--skip-per-class", type=int, default=0,
+                        help="skip the first N usable examples per class "
+                             "(to show a different batch)")
+    parser.add_argument("--candidate-cap", type=int, default=40,
+                        help="max candidates examined per class")
+    parser.add_argument("--min-pos", type=float, default=MIN_POS,
+                        help="minimum fraction of positive CAM tokens for "
+                             "both models (default 0.05)")
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--tag", default=None)
     args = parser.parse_args()
@@ -420,7 +435,10 @@ def main():
         acc_vit, len(ds_vit), acc_dmn, len(ds_dmn)))
 
     records = select_examples(vit, dmn, ds_vit, pred_vit, pred_dmn, device,
-                              args.dataset, cfg["class_names"])
+                              args.dataset, cfg["class_names"],
+                              cap=args.candidate_cap,
+                              min_pos=args.min_pos,
+                              skip_per_class=args.skip_per_class)
     print("selected:", [Path(r["name"]).name for r in records])
 
     out_png = out_dir / "{}_{}.png".format(cfg["figure_stem"], tag)
@@ -447,7 +465,11 @@ def main():
                    "98th-percentile normalization",
         "overlay": "jet, alpha = {:.2f} * cam".format(ALPHA_MAX),
         "selection": "correct for both models, shared test split, Grad-CAM "
-                     "positive fraction >= {:.0%} for both".format(MIN_POS),
+                     "positive fraction >= {:.0%} for both{}".format(
+                         args.min_pos,
+                         "" if args.skip_per_class == 0 else
+                         "; first {} usable per class skipped".format(
+                             args.skip_per_class)),
     }
     with open(out_dir / "selection_{}.json".format(tag), "w") as f:
         json.dump(meta, f, indent=2)
