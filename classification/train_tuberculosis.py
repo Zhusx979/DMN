@@ -211,6 +211,7 @@ def parse_args():
 config = Config()
 args = parse_args()
 config.network = args.network
+config.syn_variant = args.syn_variant
 config.gpu = args.gpu
 # configs store the optimizer fully lower-case ("adamw"); the branch below
 # and the run suffix expect the canonical "AdamW" spelling

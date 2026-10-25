@@ -293,6 +293,9 @@ class CenterCropMask(object):
             image = cv2.resize(image, dsize=(self.final_size, int(image.shape[0]/image.shape[1]*self.final_size)), interpolation=cv2.INTER_LINEAR)
             boundingbox = boundingbox /image.shape[1]*self.final_size
 
+        # the resize branches above turn the box into float; slicing needs ints
+        boundingbox = boundingbox.astype("int64")
+
         mask = np.zeros((self.final_size, self.final_size, 3)) 
         if(boundingbox[2]>boundingbox[0] and boundingbox[3]>boundingbox[1] and 
                 boundingbox[2]<image.shape[1] and boundingbox[3]<image.shape[0]):

@@ -8,6 +8,7 @@ from the repository root to print the current existence status of all
 datasets used by the paper experiments.
 """
 
+import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -29,7 +30,7 @@ ZK_PNEUMONIA_ROOT = "/ssd/data/medical/zk_pneumonia"
 # DeepBC breast-cancer ultrasound (3 BIRADS-based classes; Dazhou Central
 # Hospital -- the paper's private breast-cancer dataset).  Label lists below,
 # images under DEEPBC_DATA_DIR.  Published split 16008 / 1800 / 4452.
-DEEPBC_ROOT = "/ssd/data/medical/DeepBC/developmentSet"
+DEEPBC_ROOT = str(REPO_ROOT / "data" / "DeepBC")
 DEEPBC_TRAIN_TXT = f"{DEEPBC_ROOT}/label_classification/training.txt"
 DEEPBC_VAL_TXT = f"{DEEPBC_ROOT}/label_classification/val.txt"
 DEEPBC_TEST_TXT = f"{DEEPBC_ROOT}/label_classification/test.txt"
@@ -38,7 +39,8 @@ DEEPBC_DATA_DIR = f"{DEEPBC_ROOT}/data"
 # TBX11K tuberculosis chest X-ray, 3 classes.  NOT part of the published
 # version; kept for the pre-publication experiments.  datasets/classification/
 # tbx11k.py builds the pre-publication split 1920 / 240 / 240 (seed 911).
-TBX11K_ROOT = "/ssd/data/medical/TBX11K/imgs"
+TBX11K_ROOT = os.environ.get(
+    "TBX11K_ROOT", str(REPO_ROOT / "data" / "TBX11K" / "imgs"))
 
 # ---------------------------------------------------------------------------
 # Research-line segmentation experiments (not in the published version)

@@ -12,8 +12,10 @@ variant applies the softmax to the synthesized matrix:
     random           : S = R, random-initialized per-head N x N, trainable
                        (paper Eq. 4; the "Fixed" ablation is random_fixed)
     dense            : S = F1 sigma(F2(X_i)), input-conditioned: a per-head
-                       2-layer ReLU feed-forward mapping d -> d -> N, i.e.
-                       each token predicts its row of the alignment (Eq. 1-3)
+                       2-layer ReLU feed-forward mapping d -> d -> N, where
+                       d = dim_head (the per-head token width, not the full
+                       model width), i.e. each token predicts its row of the
+                       alignment (Eq. 1-3, Table 1)
     factorized_random: S = R1 R2^T with R1, R2 in R^{N x k}, k << N (Eq. 7)
     mix              : S = alpha1 (R1 R2^T) + alpha2 F(X), additive mixture of
                        factorized-random and dense (Eq. 6, paper's example)
@@ -48,6 +50,8 @@ Faithfulness notes
 
 This module depends on PyTorch only (no einops / timm).
 """
+
+import math
 
 import torch
 from torch import nn
@@ -124,15 +128,36 @@ class SynthesizerAttention(nn.Module):
             self.R1 = nn.Parameter(torch.randn(heads, n, k) * k ** -0.5)
             self.R2 = nn.Parameter(torch.randn(heads, n, k) * k ** -0.5)
         if variant in ("dense", "mix"):
-            # per-head F(X_i): d -> d -> N, ReLU in between (paper Eq. 2)
-            self.F = nn.ModuleList([
-                nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, n))
-                for _ in range(heads)
-            ])
+            # per-head F: d -> d -> N with d = dim_head (paper Eqs. 1-2 and
+            # Table 1's |theta| = d^2 + dN).  The per-head weights are stored
+            # as stacked tensors so the two GEMMs are batched over heads
+            # instead of launching 2 * heads small Linear calls per block.
+            # When the token width is not already heads * dim_head (the
+            # segmentation config: 768 vs 16 * 64), a bias-free projection
+            # supplies the per-head input; otherwise tokens are split directly.
+            self.head_proj = (nn.Linear(dim, heads * dim_head, bias=False)
+                              if dim != heads * dim_head else nn.Identity())
+            self.w1 = nn.Parameter(torch.empty(heads, dim_head, dim_head))
+            self.b1 = nn.Parameter(torch.empty(heads, dim_head))
+            self.w2 = nn.Parameter(torch.empty(heads, n, dim_head))
+            self.b2 = nn.Parameter(torch.empty(heads, n))
+            for w, b in ((self.w1, self.b1), (self.w2, self.b2)):
+                nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+                bound = 1 / math.sqrt(w.shape[-1])
+                nn.init.uniform_(b, -bound, bound)
         if variant == "mix":
             # per-head learnable mixing weights (paper Eq. 6)
             self.alpha1 = nn.Parameter(torch.zeros(heads))
             self.alpha2 = nn.Parameter(torch.zeros(heads))
+
+    def _dense_logits(self, x):
+        """Per-head F applied to the head slices: (B, heads, N, N) logits."""
+        x = self.head_proj(x)
+        b, n, _ = x.shape
+        xh = x.reshape(b, n, self.heads, self.dim_head).permute(0, 2, 1, 3)
+        h = torch.matmul(xh, self.w1) + self.b1.view(1, self.heads, 1, self.dim_head)
+        h = torch.relu(h)
+        return torch.matmul(h, self.w2.transpose(1, 2)) + self.b2.view(1, self.heads, 1, n)
 
     def _alignment(self, x):
         """S(X) for x of shape (B, N, dim); returns (B, heads, N, N) or (heads, N, N)."""
@@ -146,11 +171,10 @@ class SynthesizerAttention(nn.Module):
             s = torch.matmul(self.R1, self.R2.transpose(-1, -2))
             return torch.softmax(s, dim=-1)
         if self.variant == "dense":
-            s = torch.stack([f(x) for f in self.F], dim=1)      # (B, heads, N, N)
-            return torch.softmax(s, dim=-1)
+            return torch.softmax(self._dense_logits(x), dim=-1)
         if self.variant == "mix":
             fac = torch.matmul(self.R1, self.R2.transpose(-1, -2))
-            fx = torch.stack([f(x) for f in self.F], dim=1)
+            fx = self._dense_logits(x)
             a1 = self.alpha1.view(1, self.heads, 1, 1)
             a2 = self.alpha2.view(1, self.heads, 1, 1)
             return torch.softmax(a1 * fac + a2 * fx, dim=-1)
