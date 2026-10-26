@@ -62,10 +62,34 @@ MODEL_STYLES = {"DMN": dict(linestyle="-", linewidth=1.45),
                 "ViT": dict(linestyle=(0, (3.6, 1.6)), linewidth=1.35)}
 GOLDEN = 1.618
 
-# sequential teal -> indigo ramp for the row-normalized confusion fractions
+# Continuous teal -> indigo ramp for the row-normalized confusion fractions.
+# Anchors are explicit and at 0.0/0.2/.../1.0 (linear RGB interpolation):
+#   0.0 #FBFFFE  0.2 #D3EDE8  0.4 #8FD0C4
+#   0.6 #47A99B  0.8 #24707E  1.0 #16324F
+CONF_ANCHORS = [
+    (0.0, "#FBFFFE"),
+    (0.2, "#D3EDE8"),
+    (0.4, "#8FD0C4"),
+    (0.6, "#47A99B"),
+    (0.8, "#24707E"),
+    (1.0, "#16324F"),
+]
+# 2048 levels keep the printed colorbar smooth at 600 dpi instead of showing
+# the 256-level banding of the matplotlib default.
 CONF_CMAP = LinearSegmentedColormap.from_list(
-    "teal_indigo",
-    ["#FBFFFE", "#D3EDE8", "#8FD0C4", "#47A99B", "#24707E", "#16324F"])
+    "teal_indigo", CONF_ANCHORS, N=2048)
+
+
+def check_conf_cmap():
+    """Fail loudly if the ramp drifts from the documented anchor colours."""
+    for frac, hex_color in CONF_ANCHORS:
+        rgb = np.round(np.asarray(CONF_CMAP(frac)[:3]) * 255).astype(int)
+        want = np.array([int(hex_color[i:i + 2], 16) for i in (1, 3, 5)])
+        if np.abs(rgb - want).max() > 2:
+            raise SystemExit(
+                "confusion colormap anchor {:.1f}: {} != {}".format(
+                    frac, tuple(int(v) for v in rgb),
+                    tuple(int(v) for v in want)))
 
 
 def configure(dataset_key):
@@ -147,6 +171,7 @@ def _panel_header(fig, fig_w, fig_h, x_in, y_in, letter, title):
 def draw_confusion(results, out_png, out_pdf):
     """Two square confusion matrices with counts in the cells."""
     gc.setup_style()
+    check_conf_cmap()
     M = 2.60            # matrix side, inches (square subplots)
     GAP_BLOCKS = 0.90
     LEFT, RIGHT = 0.95, 0.18
