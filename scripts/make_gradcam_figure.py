@@ -249,14 +249,16 @@ def display_image(tensor, dataset_key):
 
 def select_examples(model_vit, model_dmn, dataset, pred_vit, pred_dmn, device,
                     dataset_key, class_names, n_per_class=2, cap=25,
-                    min_pos=MIN_POS, skip_per_class=0):
+                    min_pos=MIN_POS, skip_per_class=0, exclude=()):
     """Correct for both models, shared test split, non-degenerate Grad-CAMs."""
+    exclude = set(exclude)
     index = {p: i for i, (p, _) in enumerate(dataset.samples)}
     common = set(pred_vit) & set(pred_dmn)
     chosen = []
     for cls in range(len(class_names)):
         cands = sorted(n for n in common
-                       if pred_vit[n][0] == cls
+                       if Path(n).name not in exclude
+                       and pred_vit[n][0] == cls
                        and pred_vit[n][0] == pred_vit[n][1]
                        and pred_dmn[n][0] == pred_dmn[n][1])
         got = []
@@ -401,6 +403,8 @@ def main():
     parser.add_argument("--min-pos", type=float, default=MIN_POS,
                         help="minimum fraction of positive CAM tokens for "
                              "both models (default 0.05)")
+    parser.add_argument("--exclude", default="",
+                        help="comma-separated file names to never select")
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--tag", default=None)
     args = parser.parse_args()
@@ -434,11 +438,13 @@ def main():
     print("test accuracy: ViT {:.4f} ({} imgs), DMN {:.4f} ({} imgs)".format(
         acc_vit, len(ds_vit), acc_dmn, len(ds_dmn)))
 
+    excluded = {s.strip() for s in args.exclude.split(",") if s.strip()}
     records = select_examples(vit, dmn, ds_vit, pred_vit, pred_dmn, device,
                               args.dataset, cfg["class_names"],
                               cap=args.candidate_cap,
                               min_pos=args.min_pos,
-                              skip_per_class=args.skip_per_class)
+                              skip_per_class=args.skip_per_class,
+                              exclude=excluded)
     print("selected:", [Path(r["name"]).name for r in records])
 
     out_png = out_dir / "{}_{}.png".format(cfg["figure_stem"], tag)
@@ -470,6 +476,7 @@ def main():
                          "" if args.skip_per_class == 0 else
                          "; first {} usable per class skipped".format(
                              args.skip_per_class)),
+        "excluded": sorted(excluded),
     }
     with open(out_dir / "selection_{}.json".format(tag), "w") as f:
         json.dump(meta, f, indent=2)
